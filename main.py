@@ -360,378 +360,198 @@ def determine_frontier_path(state: SimulationState) -> None:
         state.frontier_distances = distances
 
         #-----START: To be completed by candidate-----
-        # Ring-information-sampling with goal alignment, stuck detection, and visited filtering.
-        # English comments for clarity. Only edit inside START/END block.
+        #
+        # Upgrades included:
+        # (1) Goal readiness + quick A*: if goal area sufficiently scanned and A* finds a path,
+        #     select goal directly (does not depend on goal being a frontier).
+        # (2) UNKNOWN treated as navigable (only OCC blocks) in feasibility thinking.
+        # (3) Fallback chain when selection or planning fails:
+        #     forward-hemisphere nearest frontier -> step-toward-goal (1 cell) ->
+        #     navigable neighbor improving goal distance -> hold position.
+        #
+        import math
+        import numpy as np
 
-        # --- Safe access to upstream results (frontiers, distances) ---
-        try:
-            frontiers
-        except NameError:
-            frontiers = []
-        try:
-            distances
-        except NameError:
-            distances = {}
+        # ---------- OGM helpers ----------
+        ogm = state.ogm or {}
+        grid = ogm.get("grid", None)
+        cfg  = ogm.get("cfg", {}) or {}
+        prob = (1.0 / (1.0 + np.exp(-grid))) if grid is not None else None
 
-        # --- Persistent memories on state (created once) ---
-        # visited ring cells to avoid oscillation; last choice to detect stuck
-        if not hasattr(state, "_visited_ring_cells"):
-            state._visited_ring_cells = []          # list[tuple[int,int]]
-        if not hasattr(state, "_last_choice"):
-            state._last_choice = None               # tuple[int,int] | None
-        if not hasattr(state, "_stuck_counter"):
-            state._stuck_counter = 0                # int
+        FREE_MAX = float(cfg.get("prob_free_max", 0.35))  # p <= FREE_MAX  -> free
+        OCC_MIN  = float(cfg.get("prob_occ_min", 0.65))   # p >= OCC_MIN   -> occupied
 
-        # --- Parameters (lightweight, simulator-friendly) ---
-        cell_size = state.world["cell_size_m"]
-        grid_size = state.world.get(
-            "grid_size",
-            int(round(state.world["size_m"] / cell_size))
-        )
-        R_ring = 0.5 * cell_size                    # ring radius = 0.5 cells (22.5cm) - prevent backtracking
-        K = 16                                      # angular samples
-        sense_r_m = min(
-            state.settings.get("lidar", {}).get("max_range_m", 1.2),
-            1.2
-        )
-        heading = float(state.pose["theta"])        # robot heading [rad]
-        max_visited = 10                            # tabu memory length
-        visited_skip_taxicab = 2                    # skip 2-cell neighborhood to prevent oscillation
+        def world_to_ogm_ixiy(wx: float, wy: float):
+            minx = float(ogm.get("minx", 0.0))
+            miny = float(ogm.get("miny", 0.0))
+            res  = float(ogm.get("res", 0.05))
+            ix = int((wx - minx) / res)
+            iy = int((wy - miny) / res)
+            return ix, iy
 
-        # --- OGM helpers (log-odds grid -> prob) ---
-        ogm = state.ogm
-        grid = ogm["grid"]
-        cfg = ogm["cfg"]
-        prob = 1.0 / (1.0 + np.exp(-grid))
-        FREE_MAX = cfg.get("prob_free_max", 0.35)
-        OCC_MIN  = cfg.get("prob_occ_min", 0.65)
-
-        def classify_ixiy(ix: int, iy: int) -> str:
-            """Return 'free' | 'occ' | 'unk' for OGM cell."""
-            if not (0 <= ix < grid.shape[1] and 0 <= iy < grid.shape[0]):
-                return "occ"
-            p = prob[iy, ix]
-            if p >= OCC_MIN:
-                return "occ"
-            if p <= FREE_MAX:
-                return "free"
-            return "unk"
+        def is_occupied_prob(p: float) -> bool:
+            return p >= OCC_MIN
 
         def is_navigable_cell(cell) -> bool:
-            """A cell is navigable if not occupied (can be free or unknown)."""
+            """Free or Unknown are allowed; only Occupied blocks."""
+            if grid is None or prob is None:
+                return True  # no OGM -> assume free
             cx, cy = cell
-            wx, wy = cell_center(cell, cell_size)
-            ix, iy = ogm_idx(state.ogm, wx, wy)
-            # Accept if free OR unknown (only reject occupied)
-            cell_class = classify_ixiy(ix, iy)
-            return cell_class != "occ"
+            wx, wy = cell_center(cell, state.world["cell_size_m"])
+            ix, iy = world_to_ogm_ixiy(wx, wy)
+            if not (0 <= iy < prob.shape[0] and 0 <= ix < prob.shape[1]):
+                return True  # treat OOB as free to avoid false blocks
+            p = float(prob[iy, ix])
+            return not is_occupied_prob(p)
 
-        def unknown_gain(ix: int, iy: int, r_m: float) -> int:
-            """Count unknown pixels inside a disk of radius r_m around (ix,iy)."""
-            res = ogm["res"]
-            rad = int(max(1, round(r_m / res)))
-            x0 = max(0, ix - rad); x1 = min(grid.shape[1]-1, ix + rad)
-            y0 = max(0, iy - rad); y1 = min(grid.shape[0]-1, iy + rad)
-            yy, xx = np.ogrid[y0:y1+1, x0:x1+1]
-            mask = (xx - ix)**2 + (yy - iy)**2 <= rad*rad
-            sub = prob[y0:y1+1, x0:x1+1]
-            unk = (sub > FREE_MAX) & (sub < OCC_MIN)
-            return int(unk[mask].sum())
+        # ---------- (1) Goal readiness + quick A* ----------
+        goal_cell = state.goal.get("cell", None)
+        best_frontier_cell = None
 
-        # --- Goal-alignment helper (adds "face the final goal" bias) ---
-        goal_cell = None
-        try:
-            goal_cell = state.goal.get("cell", None)
-        except Exception:
-            goal_cell = None
-        if goal_cell is not None:
-            gx_goal, gy_goal = cell_center(goal_cell, cell_size)
-            goal_angle = math.atan2(gy_goal - state.pose["y"], gx_goal - state.pose["x"])
-        else:
-            goal_angle = None
-
-        # --- Boundary penalty to avoid hugging outer walls ---
-        def boundary_penalty(wx: float, wy: float) -> float:
-            size = state.world["size_m"]
-            min_b = min(wx, wy, size - wx, size - wy)
-            if min_b <= 0.10:   return 5.0
-            if min_b <= 0.20:   return 2.0
-            if min_b <= 0.30:   return 0.5
-            return 0.0
-
-        # --- Forward clearance estimation (for suppress-forward logic) ---
-        # Estimate free distance along current heading to enable "keep going straight" behavior
-        clear_fwd = 0.0
-        max_check_m = 0.6  # check up to 60cm ahead
-        num_steps = int(max_check_m / cell_size) + 1
-        
-        for t in range(1, num_steps):
-            check_x = state.pose["x"] + t * cell_size * math.cos(heading)
-            check_y = state.pose["y"] + t * cell_size * math.sin(heading)
-            
-            # Check bounds
-            if not (0 <= check_x <= state.world["size_m"] and 
-                    0 <= check_y <= state.world["size_m"]):
-                clear_fwd = t * cell_size
-                break
-            
-            # Check if navigable
-            check_cell = (int(check_y / cell_size), int(check_x / cell_size))
-            if not is_navigable_cell(check_cell):
-                clear_fwd = t * cell_size
-                break
-        else:
-            clear_fwd = max_check_m  # fully clear ahead
-        
-        # Suppress forward sector if tight ahead (enable side-turning)
-        suppress_forward = (clear_fwd < 0.30)  # less than 30cm clear - more aggressive
-        
-        # --- Priority check: Goal scanned and reachable? ---
-        start_cell = pose_to_cell(state.world, state.pose)
-        best = None  # Define best at function start to avoid UnboundLocalError
-        goal_is_ready = False
-        
-        if goal_cell is not None:
+        if grid is not None and prob is not None and goal_cell is not None:
+            cell_size = state.world["cell_size_m"]
             gx, gy = cell_center(goal_cell, cell_size)
-            gix, giy = ogm_idx(ogm, gx, gy)
-            
-            # Check if goal cell is known (scanned)
-            goal_prob = prob[giy, gix]
-            goal_is_known = (goal_prob <= FREE_MAX or goal_prob >= OCC_MIN)
-            
-            if goal_is_known:
-                # Check nearby area (20cm) to ensure truly scanned
-                check_radius = int(0.20 / ogm["res"])
-                x0 = max(0, gix - check_radius)
-                x1 = min(grid.shape[1] - 1, gix + check_radius)
-                y0 = max(0, giy - check_radius)
-                y1 = min(grid.shape[0] - 1, giy + check_radius)
-                
-                goal_area_prob = prob[y0:y1+1, x0:x1+1]
-                unk_in_goal = ((goal_area_prob > FREE_MAX) & (goal_area_prob < OCC_MIN)).sum()
-                total_in_goal = goal_area_prob.size
-                unk_ratio_goal = unk_in_goal / max(1, total_in_goal)
-                
-                # If goal scanned (<50% unknown nearby) AND A* reachable → use goal immediately
-                if unk_ratio_goal < 0.50:
-                    try:
-                        test_path = plan_unknown_world(state, start_cell, goal_cell)
-                        if test_path and len(test_path) > 1:
-                            goal_is_ready = True
-                            print(f"✅ Goal scanned ({100*(1-unk_ratio_goal):.1f}% known) & reachable → proceeding to goal")
-                    except:
-                        pass
-        
-        if goal_is_ready:
-            best_frontier_cell = goal_cell
-        else:
-            # Goal not ready, continue exploration
-            
-            # --- Ring sampling with visited filtering + goal alignment ---
-            for k in range(K):
-                ang = 2.0 * math.pi * (k / K)
+            gix, giy = world_to_ogm_ixiy(gx, gy)
 
-                # forward-bias: reject strict backtracking
-                fwd_dot = math.cos(ang - heading)
-                if fwd_dot < 0.0:
-                    continue
-                
-                # angle difference from heading
-                ang_diff = abs((ang - heading + math.pi) % (2.0 * math.pi) - math.pi)
-                
-                # forward suppression: when tight ahead, skip forward sector to force side-turning
-                if suppress_forward and ang_diff < math.radians(60):
-                    continue  # skip ±60° forward cone when blocked - more aggressive
+            goal_known = False
+            area_ready = False
+            if 0 <= giy < grid.shape[0] and 0 <= gix < grid.shape[1]:
+                gp = float(prob[giy, gix])
+                goal_known = (gp <= FREE_MAX) or (gp >= OCC_MIN)
 
-                # sample world point on ring
-                wx = state.pose["x"] + R_ring * math.cos(ang)
-                wy = state.pose["y"] + R_ring * math.sin(ang)
+                # check a small disk around goal (radius 0.20 m)
+                res = float(ogm.get("res", 0.05))
+                rad_pix = max(1, int(round(0.20 / res)))
+                x0 = max(0, gix - rad_pix); x1 = min(grid.shape[1]-1, gix + rad_pix)
+                y0 = max(0, giy - rad_pix); y1 = min(grid.shape[0]-1, giy + rad_pix)
 
-                cx, cy = int(wx / cell_size), int(wy / cell_size)
-                if not (0 <= cx < grid_size and 0 <= cy < grid_size):
-                    continue
+                sub = prob[y0:y1+1, x0:x1+1]
+                yy, xx = np.ogrid[y0:y1+1, x0:x1+1]
+                mask = (xx - gix)**2 + (yy - giy)**2 <= (rad_pix * rad_pix)
+                sub_m = sub[mask]
 
-                cand = (cx, cy)
-                
-                # critical filter: skip current position (avoid selecting self as goal)
-                if cand == start_cell:
-                    continue
-                
-                # critical filter: skip goal cell during exploration (only use when A* confirms reachable)
-                if cand == goal_cell:
-                    continue
+                unk_mask = (sub_m > FREE_MAX) & (sub_m < OCC_MIN)
+                unk_ratio = float(np.count_nonzero(unk_mask)) / max(1, sub_m.size)
 
-                # visited filtering: skip near recently selected cells
-                skip = False
-                for vx, vy in state._visited_ring_cells:
-                    if abs(cx - vx) + abs(cy - vy) <= visited_skip_taxicab:
-                        skip = True
-                        break
-                if skip:
-                    continue
+                area_ready = (unk_ratio < 0.50)  # 50% 阈值，可调
 
-                if not is_navigable_cell(cand):
-                    continue
+            if goal_known and area_ready:
+                try:
+                    start_cell_local = pose_to_cell(state.world, state.pose)
+                    test_path = plan_unknown_world(state, start_cell_local, goal_cell)
+                    if test_path and len(test_path) > 1:
+                        best_frontier_cell = goal_cell
+                        print("✅ Goal scanned & A* reachable → using goal directly")
+                except Exception:
+                    pass
 
-                # information gain around candidate
-                gx, gy = cell_center(cand, cell_size)
-                ix, iy = ogm_idx(state.ogm, gx, gy)
-                gain = unknown_gain(ix, iy, sense_r_m)
-                if gain <= 0:
-                    continue
+        # ---------- regular frontier scoring if goal not selected ----------
+        if best_frontier_cell is None:
+            frontiers, distances = detect_frontiers(state)
 
-                # distance proxy in cells
-                d_cells = math.hypot(cx - start_cell[0], cy - start_cell[1])
-
-                # goal alignment in [0,1]; reward facing the final goal
-                if goal_angle is not None:
-                    sample_angle = math.atan2(gy - state.pose["y"], gx - state.pose["x"])
-                    goal_alignment = max(0.0, math.cos(sample_angle - goal_angle))
-                else:
-                    goal_alignment = 0.0
-
-                # straight-ahead bonus: when clear ahead, prefer continuing forward
-                straight_bonus = 0.0
-                if not suppress_forward and ang_diff < math.radians(20):
-                    straight_bonus = 8.0  # stronger bonus for going straight when clear
-                
-                # side-turn bonus: at junctions, prefer side turns over straight
-                side_bonus = 0.0
-                if ang_diff > math.radians(60):  # 60° threshold for "side turn"
-                    side_bonus = 0.5  # light bonus to explore branches
-
-                # scoring with normalized gain
-                bpen = boundary_penalty(gx, gy)
-                # Normalize gain by reasonable max (e.g., 500 pixels for 1.2m radius)
-                max_gain = 500.0
-                normalized_gain = min(gain / max_gain, 1.0)
-                
-                score = (
-                    10.0 * normalized_gain +      # information gain (dominant, normalized)
-                    0.5 * fwd_dot +               # forward bias (light)
-                    2.0 * goal_alignment +        # goal-facing bias (strong)
-                    straight_bonus +              # keep going straight when clear
-                    side_bonus -                  # explore side branches
-                    bpen                          # boundary penalty
-                )
-
-                if best is None or score > best[0]:
-                    best = (score, cand)
-
-            # --- Selection + stuck detection + memory maintenance ---
-            if best is None:
-                # fallback: closest BFS frontier if any (but not current position or backward)
-                if frontiers:
-                    # Filter out current position AND backward frontiers
-                    valid_frontiers = []
-                    for f in frontiers:
-                        if f == start_cell:
-                            continue  # skip current position
-                        
-                        # Skip goal cell (only use when A* confirms path exists)
-                        if f == goal_cell:
-                            continue
-                        
-                        # Check if frontier is in forward direction (not backward)
-                        fx, fy = cell_center(f, cell_size)
-                        to_frontier_angle = math.atan2(fy - state.pose["y"], fx - state.pose["x"])
-                        angle_diff = abs((to_frontier_angle - heading + math.pi) % (2.0 * math.pi) - math.pi)
-                        
-                        # Only accept frontiers in forward hemisphere (±90°)
-                        if angle_diff <= math.pi / 2.0:
-                            valid_frontiers.append(f)
-                    
-                    if valid_frontiers:
-                        best_frontier_cell = min(valid_frontiers, key=lambda c: distances.get(c, 1e9))
-                        print(f"⚠️ Ring sampling failed, using forward BFS frontier: {best_frontier_cell}")
-                    else:
-                        # No valid frontiers found - check if goal area is truly explored
-                        goal_cell_fallback = state.goal.get("cell", None)
-                        goal_is_ready_fallback = False
-                        
-                        if goal_cell_fallback is not None:
-                            # Critical check: is goal area truly scanned? (not OGM initialization error)
-                            gx_fb, gy_fb = cell_center(goal_cell_fallback, cell_size)
-                            gix_fb, giy_fb = ogm_idx(ogm, gx_fb, gy_fb)
-                            
-                            # Check 1: Goal cell itself must be known (not unknown)
-                            goal_prob_fb = prob[giy_fb, gix_fb]
-                            goal_is_known_fb = (goal_prob_fb <= FREE_MAX or goal_prob_fb >= OCC_MIN)
-                            
-                            if goal_is_known_fb:
-                                # Check 2: Small area around goal (20cm) should be mostly known
-                                check_radius = int(0.20 / ogm["res"])  # 20cm radius
-                                x0 = max(0, gix_fb - check_radius)
-                                x1 = min(grid.shape[1] - 1, gix_fb + check_radius)
-                                y0 = max(0, giy_fb - check_radius)
-                                y1 = min(grid.shape[0] - 1, giy_fb + check_radius)
-                                
-                                goal_area_prob = prob[y0:y1+1, x0:x1+1]
-                                unk_in_goal_area = ((goal_area_prob > FREE_MAX) & (goal_area_prob < OCC_MIN)).sum()
-                                total_in_goal_area = goal_area_prob.size
-                                unk_ratio = unk_in_goal_area / max(1, total_in_goal_area)
-                                
-                                # Goal is scanned if: goal known AND nearby <50% unknown AND A* reachable
-                                if unk_ratio < 0.50:  # relaxed: 50% threshold
-                                    try:
-                                        test_path = plan_unknown_world(state, start_cell, goal_cell_fallback)
-                                        if test_path and len(test_path) > 1:
-                                            goal_is_ready_fallback = True
-                                            print(f"✅ Goal scanned ({100*(1-unk_ratio):.1f}% known nearby) & reachable → proceeding")
-                                    except:
-                                        pass
-                                
-                                if not goal_is_ready_fallback:
-                                    print(f"⚠️ Goal nearby still {100*unk_ratio:.1f}% unknown, continue exploring")
-                            else:
-                                print(f"⚠️ Goal cell itself still unknown, continue exploring")
-                        
-                        if goal_is_ready_fallback:
-                            best_frontier_cell = goal_cell_fallback
-                        else:
-                            # Goal not ready, step toward it to explore
-                            if goal_cell_fallback is not None:
-                                dx = 1 if goal_cell_fallback[0] > start_cell[0] else (-1 if goal_cell_fallback[0] < start_cell[0] else 0)
-                                dy = 1 if goal_cell_fallback[1] > start_cell[1] else (-1 if goal_cell_fallback[1] < start_cell[1] else 0)
-                                best_frontier_cell = (start_cell[0] + dx, start_cell[1] + dy)
-                                print(f"🔄 Goal not ready, stepping toward it: {best_frontier_cell}")
-                            else:
-                                best_frontier_cell = start_cell
-                                print(f"🚨 No valid targets, holding at: {best_frontier_cell}")
-                else:
-                    best_frontier_cell = start_cell
-                    print(f"🚨 No frontiers detected, holding at current position: {best_frontier_cell}")
+            if not frontiers:
+                best_frontier_cell = goal_cell
             else:
-                best_frontier_cell = best[1]
-                print(f"✅ Ring sampling selected: {best_frontier_cell} with score: {best[0]:.3f}")
+                cell_size = state.world["cell_size_m"]
+                robot_x, robot_y, robot_th = state.pose["x"], state.pose["y"], state.pose["theta"]
+                max_bfs = max(distances.values()) if distances else 1
+                goal_dists = {c: math.hypot(c[0] - goal_cell[0], c[1] - goal_cell[1]) for c in frontiers} if goal_cell else {}
+                max_goal = max(goal_dists.values()) if goal_dists else 1
 
-        # stuck detection: repeated selection means we might be stuck
-        if best_frontier_cell == state._last_choice:
-            state._stuck_counter += 1
-        else:
-            state._stuck_counter = 0
+                def score(cell):
+                    fx, fy = cell_center(cell, cell_size)
+                    vx, vy = (fx - robot_x), (fy - robot_y)
+                    heading = math.atan2(vy, vx)
+                    align = (1.0 + math.cos(wrap(heading - robot_th))) * 0.5
+                    bfs = distances.get(cell, max_bfs)
+                    bfs_gain = 1.0 - (bfs / max_bfs if max_bfs > 0 else 1.0)
+                    goal_gain = 0.0
+                    if goal_dists:
+                        g = goal_dists.get(cell, max_goal)
+                        goal_gain = 1.0 - (g / max_goal if max_goal > 0 else 1.0)
+                    return 0.5 * align + 0.3 * bfs_gain + 0.2 * goal_gain
 
-        # recovery: clear visited memory when stuck for several cycles
-        if state._stuck_counter >= 5:
-            # English: clear tabu to allow new choices when stuck.
-            print(f"🔄 Stuck detected (counter={state._stuck_counter}), clearing {len(state._visited_ring_cells)} visited cells")
-            state._visited_ring_cells.clear()
-            state._stuck_counter = 0
-        
-        # additional recovery: if Ring failed but not stuck yet, prune oldest visited
-        if best is None and len(state._visited_ring_cells) > 5:
-            # English: when Ring fails, prune half of oldest visited to give more options
-            prune_count = len(state._visited_ring_cells) // 2
-            state._visited_ring_cells = state._visited_ring_cells[prune_count:]
-            print(f"⚠️ Ring failed, pruned {prune_count} oldest visited cells")
+                best_frontier_cell = max(frontiers, key=score)
 
-        # update memories
-        state._last_choice = best_frontier_cell
-        if best is not None:
-            state._visited_ring_cells.append(best_frontier_cell)
-            if len(state._visited_ring_cells) > max_visited:
-                state._visited_ring_cells.pop(0)
+        # ---------- Fallback chain when planning to chosen target fails ----------
+        # Verify the chosen target is actually plannable now; otherwise try fallbacks.
+        start_cell = pose_to_cell(state.world, state.pose)
+
+        def try_plan(target_cell):
+            try:
+                path = plan_unknown_world(state, start_cell, target_cell)
+                return path if (path and len(path) > 1) else None
+            except Exception:
+                return None
+
+        path_try = None
+        if best_frontier_cell is not None:
+            path_try = try_plan(best_frontier_cell)
+
+        if path_try is None:
+            # Fallback 1: forward-hemisphere nearest frontier (avoid backtracking)
+            frontiers, distances = detect_frontiers(state)
+            if frontiers:
+                fwd_frontiers = []
+                cell_size = state.world["cell_size_m"]
+                rx, ry, rth = state.pose["x"], state.pose["y"], state.pose["theta"]
+                for f in frontiers:
+                    fx, fy = cell_center(f, cell_size)
+                    ang = math.atan2(fy - ry, fx - rx)
+                    diff = abs((ang - rth + math.pi) % (2.0 * math.pi) - math.pi)
+                    if diff <= (math.pi / 2.0):  # forward hemisphere
+                        fwd_frontiers.append(f)
+                if fwd_frontiers:
+                    # prefer the nearest by BFS distance
+                    cand = min(fwd_frontiers, key=lambda c: distances.get(c, 1e9))
+                    cand_path = try_plan(cand)
+                    if cand_path is not None:
+                        best_frontier_cell = cand
+                        path_try = cand_path
+                        print(f"🔁 Fallback#1: forward BFS frontier {cand}")
+            
+        if path_try is None and goal_cell is not None:
+            # Fallback 2: step one cell toward goal (x/y ±1)
+            dx = 1 if goal_cell[0] > start_cell[0] else (-1 if goal_cell[0] < start_cell[0] else 0)
+            dy = 1 if goal_cell[1] > start_cell[1] else (-1 if goal_cell[1] < start_cell[1] else 0)
+            step_cell = (start_cell[0] + dx, start_cell[1] + dy)
+            if is_navigable_cell(step_cell):
+                step_path = try_plan(step_cell)
+                if step_path is not None:
+                    best_frontier_cell = step_cell
+                    path_try = step_path
+                    print(f"🔁 Fallback#2: step toward goal {step_cell}")
+
+        if path_try is None:
+            # Fallback 3: pick any navigable neighbor that reduces distance to goal
+            neighbors = [
+                (start_cell[0] + 1, start_cell[1]),
+                (start_cell[0] - 1, start_cell[1]),
+                (start_cell[0],     start_cell[1] + 1),
+                (start_cell[0],     start_cell[1] - 1),
+            ]
+            def goal_dist(c):
+                if goal_cell is None:
+                    return 0.0
+                return math.hypot(c[0] - goal_cell[0], c[1] - goal_cell[1])
+            base = goal_dist(start_cell)
+            better = [c for c in neighbors if is_navigable_cell(c) and goal_dist(c) < base]
+            for c in sorted(better, key=goal_dist):
+                c_path = try_plan(c)
+                if c_path is not None:
+                    best_frontier_cell = c
+                    path_try = c_path
+                    print(f"🔁 Fallback#3: neighbor toward goal {c}")
+                    break
+
+        if path_try is None:
+            # Fallback 4: hold position (last resort)
+            best_frontier_cell = start_cell
+            print("🟥 Fallback#4: hold position (no plannable target)")
+
+        # Done: best_frontier_cell is set (and path_try either valid or we hold).
         #-----END: To be completed by candidate-----
+
 
     state.frontier_goal = best_frontier_cell
     start_cell = pose_to_cell(state.world, state.pose)
